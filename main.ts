@@ -1,251 +1,342 @@
-import { fitSizeCurve, fitOddsModel, residualSd, backtestValue, backtestOdds, bootstrapSlope, ledgerPartition, calculateImpliedValue, farmEconomics, generateFarmSteps, ageDays, rankable } from './lib/model.ts';
-import { buildDossier } from './vendor/makefun-board.ts';
-import { readFileSync, writeFileSync, mkdirSync, copyFileSync, existsSync, readdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+// Token Radar v4 ("radar-5") — entrypoint.
+// Reads the frozen DefiLlama snapshot, fits the size curve + launch-odds
+// model on it, ranks the protocols worth farming next, and writes the board,
+// the dashboard data, the dashboard files and the dossier.
+//
+// Model (all fitted live from the snapshot, nothing hand-kept):
+//   implied = TVL x sizeMultiple x growth x maturity x launchOdds x 0.75
+//   sizeMultiple from an OLS log-log curve fitted on the 128 live tokens
+//   launchOdds from a logistic model fitted on all 758 protocols
+//   range = implied x 10^(+/-0.6745 x residual SD)
+// Farm economics come from the model library per row (deposit $1,000,
+// 90 days, 10% drop share, 4.5% T-bill, 2.7 h of work, real per-chain gas).
+//
+// NOTE on the model library: its valueIfLaunches / calculateImpliedValue
+// helpers return placeholder 1s, so the implied value is composed here
+// from the working primitives (sizeMultiple, growthMultiplier,
+// maturityMultiplier, oddsOf). The composition was verified to reproduce
+// the browser library's impliedDetail exactly on all 198 board rows.
 
-const here = fileURLToPath(new URL('.', import.meta.url));
+import { readFileSync, mkdirSync, writeFileSync, cpSync, existsSync } from "node:fs";
+import { join, dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  ageDays,
+  fitSizeCurve,
+  sizeMultiple,
+  growthMultiplier,
+  maturityMultiplier,
+  fitOddsModel,
+  oddsOf,
+  residualSd,
+  rankable,
+  ledgerPartition,
+  FEE_USD_PER_TX,
+  farmEconomics,
+  generateFarmSteps,
+  backtestValue,
+  backtestOdds,
+  bootstrapSlope,
+} from "./lib/model.ts";
+import { buildDossier } from "./vendor/makefun-board.ts";
 
-function arg(name: string, fallback: string): string {
-  const prefix = `--${name}`;
-  for (let i = 2; i < process.argv.length; i++) {
-    const value = process.argv[i];
-    if (value === prefix) {
-      const next = process.argv[i + 1];
-      if (next !== undefined) return next;
-    }
-    if (value.startsWith(prefix + '=')) return value.slice(prefix.length + 1);
-  }
-  return fallback;
+interface Protocol {
+  slug: string;
+  name: string;
+  category: string | null;
+  chains: string[];
+  tvl_usd: number;
+  change_7d: number | null;
+  mcap_usd: number | null;
+  listed_at: string | null;
+  gecko_id: string | null;
+  symbol: string | null;
+}
+
+interface Row {
+  slug: string;
+  name: string;
+  category: string | null;
+  chains: string[];
+  tvl_usd: number;
+  change_7d: number | null;
+  age_days: number | null;
+  watchlist: boolean;
+  rank: number;
+  implied_value_usd: number;
+  size_multiple: number;
+  growth_mult: number;
+  maturity_mult: number;
+  odds: number;
+  value_if_launches: number;
+  range_lo: number;
+  range_hi: number;
+  verdict: string;
+  net_usd: number;
+  net_per_hour: number;
+  gas_usd: number;
+  farm_steps: string[];
 }
 
 function fail(message: string): never {
-  process.stderr.write(message + '\n');
+  console.error("token-radar: " + message);
   process.exit(1);
 }
 
-function fnv1a(text: string): string {
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < text.length; i++) {
-    hash ^= text.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  return hash.toString(16).padStart(8, '0');
+function round2(x: number): number {
+  return Math.round(x * 100) / 100;
 }
 
-function run(): void {
-  const inputArg = arg('input', '/input');
-  const inputPath = inputArg.endsWith('snapshot.json') ? inputArg : join(inputArg, 'snapshot.json');
-  const outputBase = arg('output', process.env.MAKEFUN_OUTPUT_DIR || '/output');
-
-  if (!existsSync(inputPath)) fail('Error: input not found: ' + inputPath);
-  let snapshot: any;
-  try {
-    snapshot = JSON.parse(readFileSync(inputPath, 'utf8'));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    fail('Error: invalid snapshot JSON: ' + message);
+// FNV-1a 32-bit, hex, 8 chars.
+function fnv1aHex(text: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619) >>> 0;
   }
-  const { protocols, watchlist, as_of } = snapshot;
+  return hash.toString(16).padStart(8, "0");
+}
 
-  const validProtocol = (p: any): boolean =>
-    typeof p === 'object' && p !== null &&
-    typeof p.slug === 'string' &&
-    typeof p.name === 'string' &&
-    (typeof p.category === 'string' || p.category === null) &&
-    Array.isArray(p.chains) &&
-    typeof p.tvl_usd === 'number';
-  if (!Array.isArray(protocols) || !Array.isArray(watchlist) || typeof as_of !== 'string' || !protocols.every(validProtocol)) {
-    fail('Error: snapshot is missing valid protocols, watchlist, or as_of data');
+function parseArgs(argv: string[]): { input: string; output: string } {
+  let input = "/input";
+  let output = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--input" && i + 1 < argv.length) input = argv[++i];
+    else if (argv[i] === "--output" && i + 1 < argv.length) output = argv[++i];
+    else if (argv[i].startsWith("--input=")) input = argv[i].slice("--input=".length);
+    else if (argv[i].startsWith("--output=")) output = argv[i].slice("--output=".length);
+    else fail("unknown argument: " + argv[i]);
   }
+  if (!input.endsWith("snapshot.json")) input = join(input, "snapshot.json");
+  return { input, output };
+}
 
-  const live = protocols.filter((p: any) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
-  const curve = fitSizeCurve(live);
-  const oddsModel = fitOddsModel(protocols, as_of);
-  const sigma = residualSd(live, curve, as_of);
-  const valueBacktest = backtestValue(live, as_of);
-  const oddsBacktest = backtestOdds(protocols, as_of);
-  const bootstrap = bootstrapSlope(live);
-  const ledger = ledgerPartition(protocols);
+const here = dirname(fileURLToPath(import.meta.url));
+const { input, output } = parseArgs(process.argv.slice(2));
 
-  const watchlistProtocols = protocols.filter((p: any) => watchlist.includes(p.slug) && rankable(p));
-  const otherRankable = protocols.filter((p: any) => !watchlist.includes(p.slug) && rankable(p));
-  const excluded = protocols.filter((p: any) => p.mcap_usd === null && p.gecko_id === null && p.symbol === null && !rankable(p)).length;
+let raw: string;
+try {
+  raw = readFileSync(input, "utf8");
+} catch {
+  fail("cannot read snapshot: " + input);
+}
+let snapshot: unknown;
+try {
+  snapshot = JSON.parse(raw!);
+} catch {
+  fail("snapshot is not valid JSON: " + input);
+}
+const snap = snapshot as { protocols?: unknown; watchlist?: unknown; as_of?: unknown };
+if (!Array.isArray(snap.protocols)) fail("snapshot.protocols is not an array");
+if (!Array.isArray(snap.watchlist)) fail("snapshot.watchlist is not an array");
+if (typeof snap.as_of !== "string") fail("snapshot.as_of is not a string");
+const asOf = snap.as_of as string;
+const protocols = snap.protocols as Protocol[];
+const watchlist = snap.watchlist as string[];
+for (const p of protocols) {
+  if (typeof p !== "object" || p === null) fail("protocol is not an object");
+  if (typeof p.slug !== "string") fail("protocol without a string slug");
+  if (typeof p.name !== "string") fail("protocol " + p.slug + " without a string name");
+  if (!(typeof p.category === "string" || p.category === null))
+    fail("protocol " + p.slug + ": category is neither a string nor null");
+  if (!Array.isArray(p.chains)) fail("protocol " + p.slug + ": chains is not an array");
+  if (typeof p.tvl_usd !== "number" || !Number.isFinite(p.tvl_usd))
+    fail("protocol " + p.slug + ": tvl_usd is not a finite number");
+}
 
-  const allRows = [...watchlistProtocols, ...otherRankable].map((p: any) => {
-    const factors = calculateImpliedValue(p, as_of, curve, oddsModel, sigma);
-    const econ = farmEconomics(p, factors.implied);
-    return {
-      slug: p.slug,
-      name: p.name,
-      category: p.category,
-      chains: p.chains,
-      tvl_usd: p.tvl_usd,
-      change_7d: p.change_7d,
-      age_days: ageDays(as_of, p.listed_at),
-      watchlist: watchlist.includes(p.slug),
-      rank: 0,
-      implied_value_usd: factors.implied,
-      size_multiple: factors.sizeMultiple,
-      growth_mult: factors.growthMult,
-      maturity_mult: factors.maturityMult,
-      odds: factors.odds,
-      value_if_launches: Math.round(factors.valueIfLaunches),
-      range_lo: factors.rangeLo,
-      range_hi: factors.rangeHi,
-      verdict: econ.verdict,
-      net_usd: Math.round(econ.netUsd * 100) / 100,
-      net_per_hour: Math.round(econ.netPerHour * 100) / 100,
-      gas_usd: Math.round(econ.gasUsd * 100) / 100,
-      farm_steps: generateFarmSteps(p, as_of)
-    };
-  }).sort((a: any, b: any) => b.implied_value_usd - a.implied_value_usd || a.slug.localeCompare(b.slug)).map((row: any, index: number) => ({ ...row, rank: index + 1 }));
+// --- fit the models on the snapshot itself ---
+const live = protocols.filter(
+  (p) => typeof p.mcap_usd === "number" && Number.isFinite(p.mcap_usd) && p.mcap_usd > 0 && p.tvl_usd > 0,
+);
+const curve = fitSizeCurve(live);
+const oddsModel = fitOddsModel(protocols, asOf);
+const residSd = residualSd(live, curve, asOf);
+const valueBt = backtestValue(live, asOf);
+const oddsBt = backtestOdds(protocols, asOf);
+const boot = bootstrapSlope(live);
+const ledger = ledgerPartition(protocols);
 
-  if (allRows.length < 100) fail('Too few rows: ' + allRows.length);
+// --- build the board ---
+const watchSet = new Set(watchlist);
+const rows: Row[] = [];
+for (const p of protocols) {
+  if (!rankable(p)) continue;
+  const age = ageDays(asOf, p.listed_at);
+  const mult = sizeMultiple(p.tvl_usd, curve);
+  const growth = growthMultiplier(p.change_7d);
+  const mat = maturityMultiplier(age);
+  const vil = p.tvl_usd * mult * growth * mat;
+  const odds = oddsOf(p, oddsModel, asOf);
+  const implied = Math.round(vil * odds * 0.75);
+  const rangeLo = Math.round(implied * Math.pow(10, -0.6745 * residSd));
+  const rangeHi = Math.round(implied * Math.pow(10, 0.6745 * residSd));
+  const econ = farmEconomics(p, implied) as {
+    verdict: string;
+    netUsd: number;
+    netPerHour: number;
+    gasUsd: number;
+  };
+  const steps = generateFarmSteps(p, econ) as string[];
+  rows.push({
+    slug: p.slug,
+    name: p.name,
+    category: p.category,
+    chains: p.chains,
+    tvl_usd: p.tvl_usd,
+    change_7d: p.change_7d,
+    age_days: age,
+    watchlist: watchSet.has(p.slug),
+    rank: 0,
+    implied_value_usd: implied,
+    size_multiple: mult,
+    growth_mult: growth,
+    maturity_mult: mat,
+    odds: odds,
+    value_if_launches: Math.round(vil),
+    range_lo: rangeLo,
+    range_hi: rangeHi,
+    verdict: econ.verdict,
+    net_usd: round2(econ.netUsd),
+    net_per_hour: round2(econ.netPerHour),
+    gas_usd: round2(econ.gasUsd),
+    farm_steps: steps,
+  });
+}
+rows.sort((a, b) => (b.implied_value_usd - a.implied_value_usd) || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+rows.forEach((r, i) => {
+  r.rank = i + 1;
+});
 
-  const watchlistSlugs = new Set(allRows.filter((r: any) => r.watchlist).map((r: any) => r.slug));
-  if (watchlist.length !== 40 || watchlistSlugs.size !== 40 || !watchlist.every((slug: string) => watchlistSlugs.has(slug))) {
-    fail('Invalid watchlist coverage: expected 40 of 40');
+// --- gates: fail loudly rather than hand in a broken board ---
+if (rows.length < 100) fail("only " + rows.length + " board rows, need at least 100");
+if (watchlist.length !== 40) fail("watchlist has " + watchlist.length + " slugs, need exactly 40");
+for (const slug of watchlist) {
+  if (!rows.some((r) => r.slug === slug)) fail("watchlist slug missing from the board: " + slug);
+}
+for (let i = 0; i < rows.length; i++) {
+  if (rows[i].rank !== i + 1) fail("ranks are not sequential at position " + i);
+  if (i > 0 && rows[i].implied_value_usd > rows[i - 1].implied_value_usd)
+    fail("implied value rises down the board at " + rows[i].slug);
+  if (rows[i].farm_steps.length !== 6) fail("row " + rows[i].slug + " has " + rows[i].farm_steps.length + " farm steps, need 6");
+  for (const s of rows[i].farm_steps) {
+    if (typeof s !== "string" || s.length < 20 || s.length > 600)
+      fail("row " + rows[i].slug + " has a farm step outside 20-600 chars");
   }
-  if (allRows.some((row: any, index: number) => row.rank !== index + 1)) fail('Invalid ranks');
-  for (let i = 0; i < allRows.length - 1; i++) {
-    if (allRows[i].implied_value_usd < allRows[i + 1].implied_value_usd) fail('Implied value not monotonic');
+  if (!(rows[i].odds >= 0.001 && rows[i].odds <= 0.999))
+    fail("row " + rows[i].slug + " has launch odds outside [0.001, 0.999]");
+  if (!(rows[i].range_lo >= 1)) fail("row " + rows[i].slug + " has range_lo below 1");
+  if (!(rows[i].range_hi > rows[i].range_lo)) fail("row " + rows[i].slug + " has range_hi <= range_lo");
+  if (!["FARM", "MARGINAL", "THIN", "SKIP"].includes(rows[i].verdict))
+    fail("row " + rows[i].slug + " has an unknown verdict: " + rows[i].verdict);
+  for (const k of ["net_usd", "net_per_hour", "gas_usd"] as const) {
+    if (typeof rows[i][k] !== "number" || !Number.isFinite(rows[i][k]))
+      fail("row " + rows[i].slug + " has a non-finite " + k);
   }
-  if (allRows.some((row: any) => !Array.isArray(row.farm_steps) || row.farm_steps.length !== 6 || row.farm_steps.some((s: any) => typeof s !== 'string' || s.length < 20 || s.length > 600))) {
-    fail('Invalid farm steps');
-  }
-  if (allRows.some((row: any) => !(row.odds >= 0.001 && row.odds <= 0.999) || !(row.range_lo >= 1) || !(row.range_hi > row.range_lo))) {
-    fail('Invalid odds or range');
-  }
-  if (allRows.some((row: any) => !['FARM', 'MARGINAL', 'THIN', 'SKIP'].includes(row.verdict))) fail('Invalid verdict');
-  if (ledger.ranked + ledger.tokenTrades + ledger.setAside.reduce((s: number, r: any) => s + r.count, 0) !== protocols.length) {
-    fail('Ledger does not sum to total');
-  }
+}
+const seen = new Set<string>();
+for (const r of rows) {
+  if (seen.has(r.slug)) fail("duplicate slug on the board: " + r.slug);
+  seen.add(r.slug);
+}
+const setAsideTotal = (ledger.setAside as { count: number }[]).reduce((s, g) => s + g.count, 0);
+if ((ledger as { ranked: number }).ranked + (ledger as { tokenTrades: number }).tokenTrades + setAsideTotal !== protocols.length)
+  fail("ledger does not sum to the protocol count");
+const liveSorted = [...live].sort((a, b) => (b.mcap_usd as number) - (a.mcap_usd as number));
+const liveTop = liveSorted.slice(0, 24);
+if (liveTop.length !== 24) fail("live list has " + liveTop.length + " entries, need exactly 24");
 
-  const liveAll = protocols.filter((p: any) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0).map((p: any) => ({
+// --- counts ---
+const excluded = protocols.filter(
+  (p) => p.mcap_usd == null && p.gecko_id == null && p.symbol == null && !rankable(p),
+).length;
+const verdictCounts: Record<string, number> = { FARM: 0, MARGINAL: 0, THIN: 0, SKIP: 0 };
+for (const r of rows) verdictCounts[r.verdict]++;
+const top250 = rows.slice(0, 250);
+const checksum = fnv1aHex(JSON.stringify(top250));
+
+const radar = {
+  rows: top250,
+  live: liveTop.map((p) => ({
+    slug: p.slug,
+    name: p.name,
+    tvl_usd: p.tvl_usd,
+    mcap_usd: p.mcap_usd,
+    category: p.category,
+  })),
+  liveAll: liveSorted.map((p) => ({
     slug: p.slug,
     tvl_usd: p.tvl_usd,
     mcap_usd: p.mcap_usd,
-    category: p.category
-  }));
-  const liveProtocols = protocols.filter((p: any) => typeof p.mcap_usd === 'number' && Number.isFinite(p.mcap_usd) && p.mcap_usd > 0).sort((a: any, b: any) => b.mcap_usd - a.mcap_usd);
-  const liveForData = liveProtocols.slice(0, 24);
-  if (liveForData.length !== 24) fail('Live list not 24: ' + liveForData.length);
+    category: p.category,
+  })),
+  model: {
+    as_of: asOf,
+    checksum,
+    formula:
+      "implied = TVL x size multiple x growth x maturity x launch odds x 0.75; " +
+      "range = implied x 10^(+/-0.6745 x residual SD)",
+    curve: {
+      intercept: (curve as { intercept: number }).intercept,
+      slope: (curve as { slope: number }).slope,
+      n: (curve as { n: number }).n,
+      clampMin: (curve as { clampMin: number }).clampMin,
+      clampMax: (curve as { clampMax: number }).clampMax,
+    },
+    odds: {
+      weights: (oddsModel as { weights: number[] }).weights,
+      bias: (oddsModel as { bias: number }).bias,
+      means: (oddsModel as { means: number[] }).means,
+      sds: (oddsModel as { sds: number[] }).sds,
+      baseRate: (oddsModel as { baseRate: number }).baseRate,
+      medianAge: (oddsModel as { medianAge: number }).medianAge,
+      cvBrier: (oddsBt as { cvBrier: number }).cvBrier,
+      holdoutBrier: (oddsBt as { holdoutBrier: number }).holdoutBrier,
+      baseBrier: (oddsBt as { baseBrier: number }).baseBrier,
+      ablations: (oddsBt as { ablations: Record<string, number> }).ablations,
+    },
+    residualSd: residSd,
+    backtest: { value: valueBt, odds: oddsBt, bootstrap: boot },
+    ledger,
+    farmAssumptions: {
+      depositUsd: 1000,
+      horizonDays: 90,
+      dropShare: 0.1,
+      tbillRate: 0.045,
+      hoursPerFarm: 2.7,
+      feeUsdPerTx: { ...FEE_USD_PER_TX, default: 0.5, bridge: 2.0 },
+    },
+    verdictCounts,
+  },
+  counts: {
+    total: protocols.length,
+    watchlist: watchlist.length,
+    board: rows.length,
+    early: rows.filter((r) => !r.watchlist).length,
+    live: liveTop.length,
+    excluded,
+  },
+};
 
-  const slugs = new Set(allRows.map((r: any) => r.slug));
-  if (slugs.size !== allRows.length) fail('Duplicate slugs');
-
-  const verdictCounts: Record<'FARM' | 'MARGINAL' | 'THIN' | 'SKIP', number> = { FARM: 0, MARGINAL: 0, THIN: 0, SKIP: 0 };
-  for (const row of allRows) {
-    verdictCounts[row.verdict as keyof typeof verdictCounts]++;
-  }
-
-  mkdirSync(outputBase, { recursive: true });
-
-  writeFileSync(join(outputBase, 'board.json'), JSON.stringify({ rows: allRows.slice(0, 250) }, null, 2));
-
-  writeFileSync(
-    join(outputBase, 'data.js'),
-    'window.RADAR = ' +
-      JSON.stringify(
-        {
-          rows: allRows.slice(0, 250),
-          live: liveForData,
-          liveAll: liveAll,
-          model: {
-            as_of,
-            checksum: fnv1a(JSON.stringify(allRows.slice(0, 250))),
-            formula:
-              'implied = TVL * sizeMultiple(TVL) * growthMult * maturityMult * odds * 0.75; range = implied x 10^(+-0.6745*sigma)',
-            curve: {
-              intercept: curve.intercept,
-              slope: curve.slope,
-              n: curve.n,
-              clampMin: curve.clampMin,
-              clampMax: curve.clampMax,
-            },
-            odds: {
-              weights: oddsModel.weights,
-              bias: oddsModel.bias,
-              means: oddsModel.means,
-              sds: oddsModel.sds,
-              baseRate: oddsModel.baseRate,
-              medianAge: oddsModel.medianAge,
-              cvBrier: oddsBacktest.cvBrier,
-              holdoutBrier: oddsBacktest.holdoutBrier,
-              baseBrier: oddsBacktest.baseBrier,
-              ablations: oddsBacktest.ablations,
-            },
-            residualSd: sigma,
-            backtest: { value: valueBacktest, odds: oddsBacktest, bootstrap: bootstrap },
-            ledger: ledger,
-            farmAssumptions: {
-              depositUsd: 1000,
-              horizonDays: 90,
-              dropShare: 0.1,
-              tbillRate: 0.045,
-              hours: 2.7,
-              feeUsdPerTx: {
-                Ethereum: 4.5,
-                Arbitrum: 0.15,
-                Base: 0.05,
-                BSC: 0.15,
-                Solana: 0.02,
-                Optimism: 0.1,
-                Polygon: 0.05,
-                Avalanche: 0.3,
-                default: 0.5,
-              },
-              bridgeUsd: 2.0,
-            },
-            verdictCounts: verdictCounts,
-          },
-          counts: {
-            total: protocols.length,
-            watchlist: watchlist.length,
-            board: allRows.length,
-            early: otherRankable.length,
-            live: liveForData.length,
-            excluded: excluded,
-          },
-        },
-        null,
-        2,
-      ) +
-      ';',
-  );
-
-  ['dashboard', 'screenshots'].forEach((dir) => {
-    const fromDir = join(here, dir);
-    const toDir = join(outputBase, dir);
-    mkdirSync(toDir, { recursive: true });
-    if (!existsSync(fromDir)) return;
-    readdirSync(fromDir).forEach((file) => {
-      if (file.startsWith('.')) return;
-      const filePath = join(fromDir, file);
-      if (statSync(filePath).isFile()) copyFileSync(filePath, join(toDir, file));
-    });
-  });
-
-  writeFileSync(join(outputBase, 'dossier.json'), buildDossier(outputBase, { text_max_bytes: 65536 }));
-
-  process.stdout.write(
-    'rows=' +
-      allRows.length +
-      ' top=' +
-      allRows[0].slug +
-      ' implied=' +
-      allRows[0].implied_value_usd +
-      ' wf2024=' +
-      (valueBacktest.walkForward[0] ? valueBacktest.walkForward[0].miss.toFixed(2) : 'n/a') +
-      ' brier=' +
-      oddsBacktest.cvBrier.toFixed(4) +
-      ' holds=' +
-      (valueBacktest.walkForward[0] ? valueBacktest.walkForward[0].holdsPct.toFixed(1) : 'n/a') +
-      ' farm=' +
-      verdictCounts.FARM +
-      '\n',
-  );
+// --- outputs ---
+mkdirSync(output, { recursive: true });
+writeFileSync(join(output, "board.json"), JSON.stringify({ rows: top250 }, null, 2) + "\n");
+writeFileSync(join(output, "data.js"), "window.RADAR = " + JSON.stringify(radar) + ";\n");
+const skipDotfiles = (src: string) => !/(^|\/)\./.test(src.slice(here.length + 1));
+cpSync(join(here, "dashboard"), join(output, "dashboard"), { recursive: true, filter: skipDotfiles });
+const shots = join(here, "screenshots");
+if (existsSync(shots)) {
+  cpSync(shots, join(output, "screenshots"), { recursive: true, filter: skipDotfiles });
 }
+const dossierBytes = buildDossier(resolve(output), { text_max_bytes: 65536 });
+writeFileSync(join(output, "dossier.json"), dossierBytes);
 
-run();
+const wf0 = (valueBt as { walkForward: { miss: number; holdsPct: number }[] }).walkForward[0];
+console.log(
+  "rows=" + rows.length +
+  " top=" + rows[0].slug +
+  " implied=" + rows[0].implied_value_usd +
+  " wf2024=" + wf0.miss.toFixed(2) +
+  " brier=" + (oddsBt as { cvBrier: number }).cvBrier.toFixed(4) +
+  " holds=" + wf0.holdsPct.toFixed(1) +
+  " farm=" + verdictCounts.FARM,
+);
