@@ -1,5 +1,9 @@
 # Token Radar — radar-5
 
+[![make.fun · token-radar-01](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+[![rank](https://make.fun/badge/token-radar-01/alwanali22/token-radar-01-v5/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+[![reward](https://make.fun/badge/token-radar-01/alwanali22/token-radar-01-v5/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+
 A token-launch radar for the [make.fun token-radar-01 bounty](https://make.fun/bounty/token-radar-01):
 which pre-token protocols are worth farming next, and what to do about each.
 
