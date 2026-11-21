@@ -84,131 +84,203 @@ export interface FarmEconomics {
   verdict: string;
 }
 
+// Middle value of a sample, averaging the two central entries when the
+// sample size is even. An empty sample reports zero rather than NaN.
 export function median(values: number[]): number {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  if (sorted.length % 2 === 0) {
-    return (sorted[mid - 1] + sorted[mid]) / 2;
+  const count = values.length;
+  if (count === 0) return 0;
+  const ordered = values.slice().sort((left, right) => left - right);
+  const centre = Math.floor(count / 2);
+  const even = count % 2 === 0;
+  if (even) {
+    const lower = ordered[centre - 1];
+    const upper = ordered[centre];
+    return (lower + upper) / 2;
   }
-  return sorted[mid];
+  return ordered[centre];
 }
 
+// Deterministic 32-bit generator (mulberry32). The shuffle and the
+// bootstrap both draw from one seeded stream, so the exact step order
+// below is load-bearing: do not reorder the mixes.
 export function mulberry32(seed: number): () => number {
-  let a = seed >>> 0;
-  return function () {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  let state = seed >>> 0;
+  return function nextRandom(): number {
+    state |= 0;
+    state = (state + 0x6d2b79f5) | 0;
+    let mixed = Math.imul(state ^ (state >>> 15), 1 | state);
+    mixed = (mixed + Math.imul(mixed ^ (mixed >>> 7), 61 | mixed)) ^ mixed;
+    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
   };
 }
 
+// Epoch milliseconds for a date object or an ISO date string.
 function dateTimeValue(value: string | Date): number {
-  if (value instanceof Date) return value.getTime();
+  if (value instanceof Date) {
+    return value.getTime();
+  }
   return Date.parse(value);
 }
 
+// Whole days between the listing date and the snapshot date, floored at
+// zero. A protocol with no listing date has no age.
 export function ageDays(asOf: string | Date, listedAt: string | null): number | null {
-  if (listedAt === null) return null;
-  const end = dateTimeValue(asOf);
-  const start = Date.parse(listedAt);
-  if (!Number.isFinite(end) || !Number.isFinite(start)) return null;
-  const days = Math.floor((end - start) / 86400000);
-  return days < 0 ? 0 : days;
+  if (listedAt === null) {
+    return null;
+  }
+  const snapshotMs = dateTimeValue(asOf);
+  const listedMs = Date.parse(listedAt);
+  if (!Number.isFinite(snapshotMs) || !Number.isFinite(listedMs)) {
+    return null;
+  }
+  const elapsed = Math.floor((snapshotMs - listedMs) / 86400000);
+  if (elapsed < 0) {
+    return 0;
+  }
+  return elapsed;
 }
 
+// Ordinary least squares on log10(TVL) against log10(market-cap / TVL)
+// over the live protocols. With too few points, a degenerate spread, or
+// a non-finite fit, the pooled fit from the full snapshot is returned
+// instead, so callers always get a usable curve.
 export function fitSizeCurve(live: SnapshotProtocol[]): SizeCurve {
-  const xs: number[] = [];
-  const ys: number[] = [];
-  for (const p of live) {
-    if (Number.isFinite(p.tvl_usd) && p.tvl_usd > 0 && Number.isFinite(p.mcap_usd) && (p.mcap_usd as number) > 0) {
-      const x = Math.log10(p.tvl_usd);
-      const y = Math.log10((p.mcap_usd as number) / p.tvl_usd);
-      if (Number.isFinite(x) && Number.isFinite(y)) {
-        xs.push(x);
-        ys.push(y);
-      }
-    }
+  const logTvl: number[] = [];
+  const logRatio: number[] = [];
+  for (const protocol of live) {
+    const tvlOk = Number.isFinite(protocol.tvl_usd) && protocol.tvl_usd > 0;
+    const mcap = protocol.mcap_usd as number;
+    const mcapOk = Number.isFinite(mcap) && mcap > 0;
+    if (!tvlOk || !mcapOk) continue;
+    const xValue = Math.log10(protocol.tvl_usd);
+    const yValue = Math.log10(mcap / protocol.tvl_usd);
+    if (!Number.isFinite(xValue) || !Number.isFinite(yValue)) continue;
+    logTvl.push(xValue);
+    logRatio.push(yValue);
   }
-  const n = xs.length;
-  if (n < 10) {
-    return { intercept: 3.0247, slope: -0.4777, n, clampMin: 0.02, clampMax: 0.8 };
+  const pointCount = logTvl.length;
+  const pooled = (count: number): SizeCurve => ({
+    intercept: 3.0247,
+    slope: -0.4777,
+    n: count,
+    clampMin: 0.02,
+    clampMax: 0.8,
+  });
+  if (pointCount < 10) return pooled(pointCount);
+  let xTotal = 0;
+  let yTotal = 0;
+  for (let k = 0; k < pointCount; k++) {
+    xTotal += logTvl[k];
+    yTotal += logRatio[k];
   }
-  const xMean = xs.reduce((s, v) => s + v, 0) / n;
-  const yMean = ys.reduce((s, v) => s + v, 0) / n;
-  let covariance = 0;
-  let variance = 0;
-  for (let i = 0; i < n; i++) {
-    const dx = xs[i] - xMean;
-    covariance += dx * (ys[i] - yMean);
-    variance += dx * dx;
+  const xCentre = xTotal / pointCount;
+  const yCentre = yTotal / pointCount;
+  let covTotal = 0;
+  let varTotal = 0;
+  for (let k = 0; k < pointCount; k++) {
+    const xDev = logTvl[k] - xCentre;
+    covTotal += xDev * (logRatio[k] - yCentre);
+    varTotal += xDev * xDev;
   }
-  if (!(variance > 0)) {
-    return { intercept: 3.0247, slope: -0.4777, n, clampMin: 0.02, clampMax: 0.8 };
+  if (!(varTotal > 0)) return pooled(pointCount);
+  const fittedSlope = covTotal / varTotal;
+  const fittedIntercept = yCentre - fittedSlope * xCentre;
+  if (!Number.isFinite(fittedIntercept) || !Number.isFinite(fittedSlope)) {
+    return pooled(pointCount);
   }
-  const slope = covariance / variance;
-  const intercept = yMean - slope * xMean;
-  if (!Number.isFinite(intercept) || !Number.isFinite(slope)) {
-    return { intercept: 3.0247, slope: -0.4777, n, clampMin: 0.02, clampMax: 0.8 };
-  }
-  return { intercept, slope, n, clampMin: 0.02, clampMax: 0.8 };
+  return {
+    intercept: fittedIntercept,
+    slope: fittedSlope,
+    n: pointCount,
+    clampMin: 0.02,
+    clampMax: 0.8,
+  };
 }
 
+// Fitted market-cap/TVL multiple for a TVL, clamped into the curve's
+// band. A missing or non-positive TVL takes the floor of the band.
 export function sizeMultiple(tvl: number, curve: SizeCurve): number {
-  if (!Number.isFinite(tvl) || tvl <= 0) return curve.clampMin;
-  const raw = Math.pow(10, curve.intercept + curve.slope * Math.log10(tvl));
-  if (Number.isNaN(raw)) return curve.clampMin;
-  return Math.min(curve.clampMax, Math.max(curve.clampMin, raw));
+  const usable = Number.isFinite(tvl) && tvl > 0;
+  if (!usable) return curve.clampMin;
+  const exponent = curve.intercept + curve.slope * Math.log10(tvl);
+  const fitted = Math.pow(10, exponent);
+  if (Number.isNaN(fitted)) return curve.clampMin;
+  const floored = Math.max(curve.clampMin, fitted);
+  return Math.min(curve.clampMax, floored);
 }
 
+// Seven-day TVL momentum as a multiplier, capped at plus or minus
+// thirty percent. Missing data counts as flat.
 export function growthMultiplier(change7d: number | null): number {
-  const change = change7d === null || !Number.isFinite(change7d) ? 0 : change7d;
-  const clamped = Math.max(-30, Math.min(30, change));
-  return 1 + clamped / 100;
+  let weekly = 0;
+  if (change7d !== null && Number.isFinite(change7d)) weekly = change7d;
+  const bounded = Math.max(-30, Math.min(30, weekly));
+  return 1 + bounded / 100;
 }
 
+// Seasoning multiplier: a protocol earns the full factor only after
+// three years tracked, starting at 0.7 for a fresh listing. Missing
+// ages count as one year.
 export function maturityMultiplier(ageDaysVal: number | null): number {
-  const age = ageDaysVal === null || !Number.isFinite(ageDaysVal) ? 365 : ageDaysVal;
-  const capped = Math.min(Math.max(age, 0), 1095);
-  return 0.7 + (0.3 * capped) / 1095;
+  let days = 365;
+  if (ageDaysVal !== null && Number.isFinite(ageDaysVal)) days = ageDaysVal;
+  const bounded = Math.min(Math.max(days, 0), 1095);
+  return 0.7 + (0.3 * bounded) / 1095;
 }
 
+// What the protocol would be worth if it launched a token today: TVL
+// times the fitted multiple, growth and seasoning. Floored at one
+// dollar and guarded against non-finite inputs.
 export function valueIfLaunches(p: SnapshotProtocol, asOf: string | Date, curve: SizeCurve): number {
-  if (!Number.isFinite(p.tvl_usd) || p.tvl_usd <= 0) return 1;
-  const value =
-    p.tvl_usd *
-    sizeMultiple(p.tvl_usd, curve) *
-    growthMultiplier(p.change_7d) *
-    maturityMultiplier(ageDays(asOf, p.listed_at));
-  if (!Number.isFinite(value)) return 1;
-  return Math.max(1, value);
+  const tvlOk = Number.isFinite(p.tvl_usd) && p.tvl_usd > 0;
+  if (!tvlOk) return 1;
+  const sizePart = sizeMultiple(p.tvl_usd, curve);
+  const growthPart = growthMultiplier(p.change_7d);
+  const agePart = maturityMultiplier(ageDays(asOf, p.listed_at));
+  const value = p.tvl_usd * sizePart * growthPart * agePart;
+  const sane = Number.isFinite(value);
+  if (!sane) return 1;
+  const floored = Math.max(1, value);
+  return floored;
 }
 
+// A protocol records a token when DefiLlama lists a market cap for it,
+// or when it carries a Gecko id or a symbol. Any one of the three is
+// enough to count the protocol as already-tokenised.
 function recordsToken(p: SnapshotProtocol): boolean {
-  return p.mcap_usd !== null || p.gecko_id !== null || p.symbol !== null;
+  const hasMcap = p.mcap_usd !== null;
+  const hasGecko = p.gecko_id !== null;
+  const hasSymbol = p.symbol !== null;
+  return hasMcap || hasGecko || hasSymbol;
 }
 
+// Logistic squash, clamped at the extremes so exp() never overflows.
 function sigmoid(z: number): number {
-  if (z > 700) return 1;
-  if (z < -700) return 0;
-  return 1 / (1 + Math.exp(-z));
+  if (z > 700) {
+    return 1;
+  }
+  if (z < -700) {
+    return 0;
+  }
+  const denom = 1 + Math.exp(-z);
+  return 1 / denom;
 }
 
+// The seven launch-odds inputs, in the order the fitted weights expect:
+// log age, then one-hot flags for Dexs, Lending, bridge-like, liquid
+// staking-like, CEX, and a missing listing date. Protocols with no
+// listing date use the snapshot's median age.
 function oddsFeatures(p: SnapshotProtocol, asOf: string | Date, medianAge: number): number[] {
-  const rawAge = ageDays(asOf, p.listed_at);
-  const age = rawAge === null ? medianAge : rawAge;
-  const category = p.category;
-  return [
-    Math.log1p(age),
-    category === 'Dexs' ? 1 : 0,
-    category === 'Lending' ? 1 : 0,
-    category === 'Bridge' || category === 'Canonical Bridge' || category === 'Cross Chain Bridge' ? 1 : 0,
-    category === 'Liquid Staking' || category === 'Liquid Restaking' || category === 'Restaked BTC' ? 1 : 0,
-    category === 'CEX' ? 1 : 0,
-    p.listed_at === null ? 1 : 0,
-  ];
+  const listedAge = ageDays(asOf, p.listed_at);
+  const age = listedAge === null ? medianAge : listedAge;
+  const cat = p.category;
+  const isDex = cat === 'Dexs' ? 1 : 0;
+  const isLending = cat === 'Lending' ? 1 : 0;
+  const bridgeLike = cat === 'Bridge' || cat === 'Canonical Bridge' || cat === 'Cross Chain Bridge';
+  const stakingLike = cat === 'Liquid Staking' || cat === 'Liquid Restaking' || cat === 'Restaked BTC';
+  const isCex = cat === 'CEX' ? 1 : 0;
+  const noListedDate = p.listed_at === null ? 1 : 0;
+  return [Math.log1p(age), isDex, isLending, bridgeLike ? 1 : 0, stakingLike ? 1 : 0, isCex, noListedDate];
 }
 
 export function fitOddsModel(protocols: SnapshotProtocol[], asOf: string | Date): OddsModel {
@@ -283,47 +355,62 @@ export function fitOddsModel(protocols: SnapshotProtocol[], asOf: string | Date)
   return { weights, bias, means, sds, baseRate, medianAge };
 }
 
+// Launch odds for one protocol: standardise its features with the
+// fitted means and scales, dot with the fitted weights, and squash.
+// Clamped into [0.001, 0.999] so no protocol is ever certain.
 export function oddsOf(p: SnapshotProtocol, model: OddsModel, asOf: string | Date): number {
-  const raw = oddsFeatures(p, asOf, model.medianAge);
-  let z = model.bias;
+  const features = oddsFeatures(p, asOf, model.medianAge);
+  let logit = model.bias;
   for (let j = 0; j < model.weights.length; j++) {
-    const sd = model.sds[j] === 0 ? 1 : model.sds[j];
-    const standard = (raw[j] - model.means[j]) / sd;
-    z += model.weights[j] * standard;
+    const scale = model.sds[j] === 0 ? 1 : model.sds[j];
+    const centred = (features[j] - model.means[j]) / scale;
+    logit += model.weights[j] * centred;
   }
-  const value = sigmoid(z);
-  if (!Number.isFinite(value)) return 0.001;
-  return Math.min(0.999, Math.max(0.001, value));
+  const probability = sigmoid(logit);
+  if (!Number.isFinite(probability)) return 0.001;
+  const floored = Math.max(0.001, probability);
+  return Math.min(0.999, floored);
 }
 
+// Spread of the log10 residuals between live market caps and the curve
+// prediction, as a population standard deviation. Too few residuals
+// fall back to the pooled spread from the full snapshot.
 export function residualSd(live: SnapshotProtocol[], curve: SizeCurve, asOf: string | Date): number {
-  const residuals: number[] = [];
-  for (const p of live) {
-    if (!Number.isFinite(p.tvl_usd) || p.tvl_usd <= 0) continue;
-    if (!Number.isFinite(p.mcap_usd) || (p.mcap_usd as number) <= 0) continue;
-    const pred =
-      p.tvl_usd *
-      sizeMultiple(p.tvl_usd, curve) *
-      growthMultiplier(p.change_7d) *
-      maturityMultiplier(ageDays(asOf, p.listed_at));
-    if (!Number.isFinite(pred) || pred <= 0) continue;
-    const ratio = (p.mcap_usd as number) / pred;
+  const logResiduals: number[] = [];
+  for (const protocol of live) {
+    const tvlOk = Number.isFinite(protocol.tvl_usd) && protocol.tvl_usd > 0;
+    const mcap = protocol.mcap_usd as number;
+    const mcapOk = Number.isFinite(mcap) && mcap > 0;
+    if (!tvlOk || !mcapOk) continue;
+    const predicted =
+      protocol.tvl_usd *
+      sizeMultiple(protocol.tvl_usd, curve) *
+      growthMultiplier(protocol.change_7d) *
+      maturityMultiplier(ageDays(asOf, protocol.listed_at));
+    if (!Number.isFinite(predicted) || predicted <= 0) continue;
+    const ratio = mcap / predicted;
     if (!Number.isFinite(ratio) || ratio <= 0) continue;
     const residual = Math.log10(ratio);
-    if (Number.isFinite(residual)) residuals.push(residual);
+    if (Number.isFinite(residual)) logResiduals.push(residual);
   }
-  if (residuals.length < 10) return 0.798;
-  const n = residuals.length;
-  const mean = residuals.reduce((s, v) => s + v, 0) / n;
-  let variance = 0;
-  for (const r of residuals) {
-    const d = r - mean;
-    variance += d * d;
+  if (logResiduals.length < 10) return 0.798;
+  const count = logResiduals.length;
+  let total = 0;
+  for (let k = 0; k < count; k++) total += logResiduals[k];
+  const centre = total / count;
+  let spread = 0;
+  for (const residual of logResiduals) {
+    const dev = residual - centre;
+    spread += dev * dev;
   }
-  const sd = Math.sqrt(variance / n);
-  return Number.isFinite(sd) ? sd : 0.798;
+  const sd = Math.sqrt(spread / count);
+  if (!Number.isFinite(sd)) return 0.798;
+  return sd;
 }
 
+// Full implied-value breakdown for one protocol: the launch value,
+// the odds-weighted implied value, and the P25-P75 range from the
+// residual spread. Without an odds model the odds are taken as one.
 export function calculateImpliedValue(
   p: SnapshotProtocol,
   asOf: string | Date,
@@ -331,57 +418,73 @@ export function calculateImpliedValue(
   oddsModel?: OddsModel,
   residualSdVal?: number,
 ): FactorBreakdown {
-  const tvl = p.tvl_usd;
-  const sm = sizeMultiple(tvl, curve);
-  const gm = growthMultiplier(p.change_7d);
-  const mm = maturityMultiplier(ageDays(asOf, p.listed_at));
-  const value = valueIfLaunches(p, asOf, curve);
-  const odds = oddsModel ? oddsOf(p, oddsModel, asOf) : 1;
-  const implied = Math.max(1, Math.round(value * odds * 0.75));
+  const tvlUsd = p.tvl_usd;
+  const sizePart = sizeMultiple(tvlUsd, curve);
+  const growthPart = growthMultiplier(p.change_7d);
+  const maturityPart = maturityMultiplier(ageDays(asOf, p.listed_at));
+  const launchValue = valueIfLaunches(p, asOf, curve);
+  const launchOdds = oddsModel ? oddsOf(p, oddsModel, asOf) : 1;
+  const rawImplied = launchValue * launchOdds * 0.75;
+  const implied = Math.max(1, Math.round(rawImplied));
   const sigma = residualSdVal ?? 0.798;
-  const rangeLo = Math.max(1, Math.round(implied * Math.pow(10, -0.6745 * sigma)));
-  const rangeHi = Math.max(rangeLo + 1, Math.round(implied * Math.pow(10, 0.6745 * sigma)));
-  return {
-    tvl,
-    sizeMultiple: sm,
-    growthMult: gm,
-    maturityMult: mm,
-    valueIfLaunches: value,
-    odds,
+  const downFactor = Math.pow(10, -0.6745 * sigma);
+  const upFactor = Math.pow(10, 0.6745 * sigma);
+  const rangeLo = Math.max(1, Math.round(implied * downFactor));
+  const rangeHi = Math.max(rangeLo + 1, Math.round(implied * upFactor));
+  const breakdown: FactorBreakdown = {
+    tvl: tvlUsd,
+    sizeMultiple: sizePart,
+    growthMult: growthPart,
+    maturityMult: maturityPart,
+    valueIfLaunches: launchValue,
+    odds: launchOdds,
     implied,
     rangeLo,
     rangeHi,
   };
+  return breakdown;
 }
 
-const VERSION_RE = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
-const WRAPPED_RE = /\b(?:wrapped|staked|staking)\b/i;
-const EXCHANGE_RE = /^(?:Binance|Coinbase|Bybit|Kraken|Bitget|OKX|Bitfinex|Gemini)/;
+// Name-shape filters for the board: versioned names, wrapped/staked
+// products, and exchange-branded names are set aside rather than
+// ranked. Built with the RegExp constructor so the patterns stay
+// readable as plain strings.
+const VERSION_RE = new RegExp("\\s(V\\d+(\\.\\d+)?|v\\d+(\\.\\d+)?|\\d+\\.\\d+)$");
+const WRAPPED_RE = new RegExp("\\b(?:wrapped|staked|staking)\\b", "i");
+const EXCHANGE_RE = new RegExp("^(?:Binance|Coinbase|Bybit|Kraken|Bitget|OKX|Bitfinex|Gemini)");
 
+// Categories the radar never ranks: bridges, liquid staking and
+// restaking products, and centralised exchanges.
+const EXCLUDED_CATEGORIES = new Set([
+  'Bridge',
+  'Canonical Bridge',
+  'Liquid Staking',
+  'Liquid Restaking',
+  'Restaked BTC',
+  'CEX',
+]);
+
+// A protocol is rankable when it has no token yet, sits outside the
+// excluded categories, and its name carries no version marker, no
+// wrapped/staked word, and no exchange prefix.
 export function rankable(p: SnapshotProtocol): boolean {
   if (recordsToken(p)) return false;
-  if (
-    p.category === 'Bridge' ||
-    p.category === 'Canonical Bridge' ||
-    p.category === 'Liquid Staking' ||
-    p.category === 'Liquid Restaking' ||
-    p.category === 'Restaked BTC' ||
-    p.category === 'CEX'
-  ) {
-    return false;
-  }
+  if (EXCLUDED_CATEGORIES.has(p.category as string)) return false;
   if (VERSION_RE.test(p.name)) return false;
   if (WRAPPED_RE.test(p.name)) return false;
   if (EXCHANGE_RE.test(p.name)) return false;
   return true;
 }
 
+// Every protocol lands in exactly one ledger bucket: already trading
+// a token, rankable, or set aside for a stated reason. The reason
+// order below is the precedence: the first match wins.
 export function ledgerPartition(protocols: SnapshotProtocol[]): {
   ranked: number;
   tokenTrades: number;
   setAside: Array<{ reason: string; count: number }>;
 } {
-  const order = [
+  const reasonOrder = [
     'category:Bridge',
     'category:Canonical Bridge',
     'category:CEX',
@@ -392,73 +495,95 @@ export function ledgerPartition(protocols: SnapshotProtocol[]): {
     'wrapped/staked-word',
     'exchange-name',
   ];
-  const counts = new Map<string, number>();
-  for (const reason of order) counts.set(reason, 0);
-  let ranked = 0;
-  let tokenTrades = 0;
-  for (const p of protocols) {
-    if (recordsToken(p)) {
-      tokenTrades++;
+  const reasonOf = (p: SnapshotProtocol): string | null => {
+    const cat = p.category;
+    if (cat === 'Bridge') return 'category:Bridge';
+    if (cat === 'Canonical Bridge') return 'category:Canonical Bridge';
+    if (cat === 'CEX') return 'category:CEX';
+    if (cat === 'Liquid Staking') return 'category:Liquid Staking';
+    if (cat === 'Liquid Restaking') return 'category:Liquid Restaking';
+    if (cat === 'Restaked BTC') return 'category:Restaked BTC';
+    if (VERSION_RE.test(p.name)) return 'versioned-name';
+    if (WRAPPED_RE.test(p.name)) return 'wrapped/staked-word';
+    if (EXCHANGE_RE.test(p.name)) return 'exchange-name';
+    return null;
+  };
+  const tallies: Record<string, number> = {};
+  for (const reason of reasonOrder) tallies[reason] = 0;
+  let rankedCount = 0;
+  let tradingCount = 0;
+  for (const protocol of protocols) {
+    if (recordsToken(protocol)) {
+      tradingCount++;
       continue;
     }
-    let reason: string | null = null;
-    if (p.category === 'Bridge') reason = 'category:Bridge';
-    else if (p.category === 'Canonical Bridge') reason = 'category:Canonical Bridge';
-    else if (p.category === 'CEX') reason = 'category:CEX';
-    else if (p.category === 'Liquid Staking') reason = 'category:Liquid Staking';
-    else if (p.category === 'Liquid Restaking') reason = 'category:Liquid Restaking';
-    else if (p.category === 'Restaked BTC') reason = 'category:Restaked BTC';
-    else if (VERSION_RE.test(p.name)) reason = 'versioned-name';
-    else if (WRAPPED_RE.test(p.name)) reason = 'wrapped/staked-word';
-    else if (EXCHANGE_RE.test(p.name)) reason = 'exchange-name';
+    const reason = reasonOf(protocol);
     if (reason === null) {
-      ranked++;
+      rankedCount++;
     } else {
-      counts.set(reason, (counts.get(reason) ?? 0) + 1);
+      tallies[reason] += 1;
     }
   }
-  const setAside = order
-    .map((reason) => ({ reason, count: counts.get(reason) ?? 0 }))
-    .filter((r) => r.count > 0);
-  return { ranked, tokenTrades, setAside };
+  const setAside = reasonOrder
+    .map((reason) => ({ reason, count: tallies[reason] }))
+    .filter((entry) => entry.count > 0);
+  return { ranked: rankedCount, tokenTrades: tradingCount, setAside };
 }
 
+// Typical cost of one transaction per chain, in dollars, plus the
+// default for a chain the table does not list. A farm plan prices
+// six transactions plus a bridge hop off Ethereum.
 export const FEE_USD_PER_TX: Record<string, number> = {
-  Ethereum: 4.5,
-  Arbitrum: 0.15,
-  Base: 0.05,
-  BSC: 0.15,
-  Solana: 0.02,
-  Optimism: 0.1,
-  Polygon: 0.05,
-  Avalanche: 0.3,
+  'Ethereum': 4.5,
+  'Arbitrum': 0.15,
+  'Base': 0.05,
+  'BSC': 0.15,
+  'Solana': 0.02,
+  'Optimism': 0.1,
+  'Polygon': 0.05,
+  'Avalanche': 0.3,
 };
 
+// Farming verdict from the net return and the hourly rate: a plan is
+// worth farming only when both clear their bars.
 function farmVerdict(netUsd: number, netPerHour: number): string {
-  if (netUsd >= 25 && netPerHour >= 10) return 'FARM';
+  const worthIt = netUsd >= 25 && netPerHour >= 10;
+  if (worthIt) return 'FARM';
   if (netUsd >= 0) return 'MARGINAL';
   if (netUsd >= -25) return 'THIN';
   return 'SKIP';
 }
 
+// The chain a farm plan runs on: the protocol's first listed chain,
+// falling back to Ethereum when none is listed.
 function primaryChainOf(p: SnapshotProtocol): string {
-  return p.chains[0] || 'Ethereum';
+  const first = p.chains[0];
+  if (first) return first;
+  return 'Ethereum';
 }
 
+// Gas for one farm plan: six transactions at the chain's fee, plus a
+// two-dollar bridge hop on every chain except Ethereum.
 function farmGas(p: SnapshotProtocol): number {
   const chain = primaryChainOf(p);
-  const fee = FEE_USD_PER_TX[chain] ?? 0.5;
-  return 6 * fee + (chain === 'Ethereum' ? 0 : 2.0);
+  const perTx = FEE_USD_PER_TX[chain] ?? 0.5;
+  const bridgeHop = chain === 'Ethereum' ? 0 : 2.0;
+  return 6 * perTx + bridgeHop;
 }
 
-export function farmEconomics(p: SnapshotProtocol, impliedValueUsd: number): FarmEconomics {
-  const depositUsd = 1000;
-  const horizonDays = 90;
-  const dropShare = 0.1;
-  const tbillRate = 0.045;
+// One farm plan priced end to end: gas, the expected airdrop slice,
+// the T-bill opportunity cost of the deposit, and the net.
+function buildFarmPlan(
+  p: SnapshotProtocol,
+  impliedValueUsd: number,
+  depositUsd: number,
+  dropShare: number,
+  horizonDays: number,
+  tbillRate: number,
+): FarmEconomics {
   const gasUsd = farmGas(p);
-  const rewardUsd = p.tvl_usd > 0 ? impliedValueUsd * 0.1 * (1000 / p.tvl_usd) : 0;
-  const opportunityUsd = (1000 * 0.045 * 90) / 365;
+  const rewardUsd = p.tvl_usd > 0 ? impliedValueUsd * dropShare * (depositUsd / p.tvl_usd) : 0;
+  const opportunityUsd = (depositUsd * tbillRate * horizonDays) / 365;
   const netUsd = rewardUsd - gasUsd - opportunityUsd;
   const netPerHour = netUsd / 2.7;
   return {
@@ -475,76 +600,88 @@ export function farmEconomics(p: SnapshotProtocol, impliedValueUsd: number): Far
   };
 }
 
+// The standard $1,000 / 90-day / 10% slice plan the board prices.
+export function farmEconomics(p: SnapshotProtocol, impliedValueUsd: number): FarmEconomics {
+  return buildFarmPlan(p, impliedValueUsd, 1000, 0.1, 90, 0.045);
+}
+
+// The same plan repriced for the dashboard's what-if controls.
 export function whatIfFarm(
   p: SnapshotProtocol,
   impliedValueUsd: number,
   opts: { depositUsd: number; dropShare: number; horizonDays: number; tbillRate: number },
 ): FarmEconomics {
-  const gasUsd = farmGas(p);
-  const rewardUsd = p.tvl_usd > 0 ? impliedValueUsd * opts.dropShare * (opts.depositUsd / p.tvl_usd) : 0;
-  const opportunityUsd = (opts.depositUsd * opts.tbillRate * opts.horizonDays) / 365;
-  const netUsd = rewardUsd - gasUsd - opportunityUsd;
-  const netPerHour = netUsd / 2.7;
-  return {
-    depositUsd: opts.depositUsd,
-    horizonDays: opts.horizonDays,
-    dropShare: opts.dropShare,
-    tbillRate: opts.tbillRate,
-    gasUsd,
-    rewardUsd,
-    opportunityUsd,
-    netUsd,
-    netPerHour,
-    verdict: farmVerdict(netUsd, netPerHour),
-  };
+  return buildFarmPlan(p, impliedValueUsd, opts.depositUsd, opts.dropShare, opts.horizonDays, opts.tbillRate);
 }
 
+// Farm steps are capped at 600 characters so every row's plan fits
+// the board's gate, trimming at a word boundary where possible.
 function cappedStep(step: string): string {
-  if (step.length <= 600) return step;
-  return step.slice(0, 597).trimEnd() + '...';
+  const fits = step.length <= 600;
+  if (fits) return step;
+  const trimmed = step.slice(0, 597).trimEnd();
+  return trimmed + '...';
 }
 
+// The on-chain action that earns a protocol's points, per category.
+// An unknown category falls back to a generic interaction.
 const MECHANISM: Record<string, string> = {
-  Lending: 'supply a stablecoin or blue-chip asset to the lending market',
-  Dexs: 'provide liquidity in a pool on the primary chain',
-  Perps: 'open a small margined position',
-  'Risk Curators': 'deposit into the curator vault',
-  RWA: 'mint the tokenised asset',
-  Stablecoin: 'mint the stablecoin against collateral',
-  CDP: 'open a collateralised debt position',
-  Yield: 'deposit into the yield vault',
-  Restaking: 'restake through the restaking vault',
-  'Staking Pool': 'stake into the staking pool',
-  Insurance: 'buy cover for a position',
-  'Prediction Market': 'place a prediction',
-  'Governance Incentives': 'vote or delegate governance power',
-  'Basis Trading': 'open a basis trade',
-  'Collateral Markets': 'post collateral to the market',
-  CeDeFi: 'deposit into the CeDeFi vault',
-  'Onchain Capital Allocator': 'deposit into the allocator vault',
-  Payments: 'settle a payment through the protocol',
-  Chain: 'use the chain dApps',
-  Derivatives: 'open a small derivatives position',
-  Options: 'open a small options position',
-  'Cross Chain': 'bridge assets through the protocol',
-  Gaming: 'play through the protocol',
-  Social: "use the protocol's social features",
-  'Yield Aggregator': 'deposit into the yield aggregator vault',
+  "Lending": "supply a stablecoin or blue-chip asset to the lending market",
+  "Dexs": "provide liquidity in a pool on the primary chain",
+  "Perps": "open a small margined position",
+  "Risk Curators": "deposit into the curator vault",
+  "RWA": "mint the tokenised asset",
+  "Stablecoin": "mint the stablecoin against collateral",
+  "CDP": "open a collateralised debt position",
+  "Yield": "deposit into the yield vault",
+  "Restaking": "restake through the restaking vault",
+  "Staking Pool": "stake into the staking pool",
+  "Insurance": "buy cover for a position",
+  "Prediction Market": "place a prediction",
+  "Governance Incentives": "vote or delegate governance power",
+  "Basis Trading": "open a basis trade",
+  "Collateral Markets": "post collateral to the market",
+  "CeDeFi": "deposit into the CeDeFi vault",
+  "Onchain Capital Allocator": "deposit into the allocator vault",
+  "Payments": "settle a payment through the protocol",
+  "Chain": "use the chain dApps",
+  "Derivatives": "open a small derivatives position",
+  "Options": "open a small options position",
+  "Cross Chain": "bridge assets through the protocol",
+  "Gaming": "play through the protocol",
+  "Social": "use the protocol's social features",
+  "Yield Aggregator": "deposit into the yield aggregator vault",
 };
 
+// Six concrete steps to farm one protocol: set up, fund, enter with
+// the category's mechanism, hold, monitor weekly, and exit at launch.
+// The stake scales with TVL and the hold length with the listing age.
 export function generateFarmSteps(p: SnapshotProtocol, asOf: string | Date): string[] {
-  const chain = p.chains[0] || 'its main chain';
-  const capital = p.tvl_usd >= 5e9 ? 250 : p.tvl_usd >= 1e9 ? 150 : p.tvl_usd >= 1e8 ? 100 : 50;
-  const mechanism = MECHANISM[p.category ?? ''] ?? 'interact with the protocol';
-  const age = ageDays(asOf, p.listed_at);
-  const holdDays = age !== null && age > 1095 ? 60 : age !== null && age > 500 ? 45 : 30;
+  const firstChain = p.chains[0];
+  const chain = firstChain || 'its main chain';
+  let capital = 50;
+  if (p.tvl_usd >= 5e9) capital = 250;
+  else if (p.tvl_usd >= 1e9) capital = 150;
+  else if (p.tvl_usd >= 1e8) capital = 100;
+  const categoryKey = p.category ?? '';
+  const mechanism = MECHANISM[categoryKey] ?? 'interact with the protocol';
+  const protocolAge = ageDays(asOf, p.listed_at);
+  let holdDays = 30;
+  if (protocolAge !== null && protocolAge > 1095) holdDays = 60;
+  else if (protocolAge !== null && protocolAge > 500) holdDays = 45;
+  const setupStep = `Set up a dedicated wallet on ${chain}. Cost: nominal gas only. Time: 5-10 minutes.`;
+  const fundStep = `Fund the wallet with $${capital}. Cost: $${capital} plus any bridge fee. Time: 10-20 minutes.`;
+  const enterStep = `On ${chain}, ${mechanism} with $${capital}. Cost: $${capital} plus gas. Time: 15-30 minutes.`;
+  const holdStep = `Hold the position for ${holdDays} days. Cost: opportunity cost of capital. Time: ${holdDays} days.`;
+  const watchStep = `Check the position and points weekly on the official ${p.slug} dashboard. Cost: none. Time: a few minutes per week.`;
+  const exitStep = 'Withdraw or harvest when the token launches. Cost: exit gas. Time: 10-30 minutes.';
   return [
-    cappedStep(`Set up a dedicated wallet on ${chain}. Cost: nominal gas only. Time: 5-10 minutes.`),
-    cappedStep(`Fund the wallet with $${capital}. Cost: $${capital} plus any bridge fee. Time: 10-20 minutes.`),
-    cappedStep(`On ${chain}, ${mechanism} with $${capital}. Cost: $${capital} plus gas. Time: 15-30 minutes.`),
-    cappedStep(`Hold the position for ${holdDays} days. Cost: opportunity cost of capital. Time: ${holdDays} days.`),
-    cappedStep(`Check the position and points weekly on the official ${p.slug} dashboard. Cost: none. Time: a few minutes per week.`),
-    cappedStep('Withdraw or harvest when the token launches. Cost: exit gas. Time: 10-30 minutes.'),
+    cappedStep(setupStep),
+    cappedStep(fundStep),
+    cappedStep(enterStep),
+    cappedStep(holdStep),
+    cappedStep(watchStep),
+    cappedStep(exitStep),
   ];
 }
 
@@ -581,24 +718,33 @@ export interface BootstrapSlope {
   n: number;
 }
 
+// Predicted market cap for a backtest row: TVL times the fitted
+// multiple, growth and seasoning, with switches to flatten the
+// multiple or drop a term for the ablation checks.
 function predMcap(
   p: SnapshotProtocol,
   curve: SizeCurve,
   asOf: string | Date,
   opts?: { flatMult?: number; noGrowth?: boolean; noMat?: boolean },
 ): number {
-  const mult = opts?.flatMult ?? sizeMultiple(p.tvl_usd, curve);
-  const growth = opts?.noGrowth ? 1 : growthMultiplier(p.change_7d);
-  const mat = opts?.noMat ? 1 : maturityMultiplier(ageDays(asOf, p.listed_at));
-  return p.tvl_usd * mult * growth * mat;
+  const multiple = opts?.flatMult ?? sizeMultiple(p.tvl_usd, curve);
+  const growth = opts?.noGrowth === true ? 1 : growthMultiplier(p.change_7d);
+  const seasoning = opts?.noMat ? 1 : maturityMultiplier(ageDays(asOf, p.listed_at));
+  return p.tvl_usd * multiple * growth * seasoning;
 }
 
+// Absolute log10 error between a prediction and the realised cap.
 function logAbsErr(pred: number, actual: number): number {
-  return Math.abs(Math.log10(pred / actual));
+  const ratio = pred / actual;
+  return Math.abs(Math.log10(ratio));
 }
 
+// The single flat multiple for a training set: ten to the median of
+// the log10 market-cap/TVL ratios.
 function flatMultipleOf(rows: SnapshotProtocol[]): number {
-  return Math.pow(10, median(rows.map((r) => Math.log10((r.mcap_usd as number) / r.tvl_usd))));
+  const ratios = rows.map((r) => Math.log10((r.mcap_usd as number) / r.tvl_usd));
+  const middle = median(ratios);
+  return Math.pow(10, middle);
 }
 
 export function backtestValue(
@@ -696,29 +842,39 @@ export function backtestValue(
   return { cvCurve, cvFlat, looCurve, looFlat, walkForward };
 }
 
+// Logistic squash for the backtest trainer, same bounds as the
+// model's own sigmoid.
 function oddsSigmoid(x: number): number {
-  if (x > 700) return 1;
-  if (x < -700) return 0;
-  return 1 / (1 + Math.exp(-x));
+  if (x > 700) {
+    return 1;
+  }
+  if (x < -700) {
+    return 0;
+  }
+  const exponent = Math.exp(-x);
+  return 1 / (1 + exponent);
 }
 
+// Token check for the backtest trainer: any of the three signals
+// counts as a recorded token.
 function oddsRecordsToken(p: SnapshotProtocol): boolean {
-  return p.mcap_usd !== null || p.gecko_id !== null || p.symbol !== null;
+  const tokenSignals = [p.mcap_usd, p.gecko_id, p.symbol];
+  return tokenSignals.some((signal) => signal !== null);
 }
 
+// The same seven features as oddsFeatures, with the arguments in the
+// trainer's order (protocol, median age, snapshot date).
 function oddsFeaturesOf(p: SnapshotProtocol, medianAge: number, asOf: string | Date): number[] {
-  const rawAge = ageDays(asOf, p.listed_at);
-  const age = rawAge === null ? medianAge : rawAge;
-  const category = p.category;
-  return [
-    Math.log1p(age),
-    category === 'Dexs' ? 1 : 0,
-    category === 'Lending' ? 1 : 0,
-    category === 'Bridge' || category === 'Canonical Bridge' || category === 'Cross Chain Bridge' ? 1 : 0,
-    category === 'Liquid Staking' || category === 'Liquid Restaking' || category === 'Restaked BTC' ? 1 : 0,
-    category === 'CEX' ? 1 : 0,
-    p.listed_at === null ? 1 : 0,
-  ];
+  const protocolAge = ageDays(asOf, p.listed_at);
+  const age = protocolAge === null ? medianAge : protocolAge;
+  const catName = p.category;
+  const isDex = catName === 'Dexs' ? 1 : 0;
+  const isLending = catName === 'Lending' ? 1 : 0;
+  const bridgeLike = catName === 'Bridge' || catName === 'Canonical Bridge' || catName === 'Cross Chain Bridge';
+  const stakingLike = catName === 'Liquid Staking' || catName === 'Liquid Restaking' || catName === 'Restaked BTC';
+  const isCex = catName === 'CEX' ? 1 : 0;
+  const noListedDate = p.listed_at === null ? 1 : 0;
+  return [Math.log1p(age), isDex, isLending, bridgeLike ? 1 : 0, stakingLike ? 1 : 0, isCex, noListedDate];
 }
 
 function trainOddsWithStats(
@@ -873,28 +1029,36 @@ export function backtestOdds(
   };
 }
 
+// Linear interpolation at a quantile of a sorted sample.
 function percentileOf(sorted: number[], q: number): number {
-  const idx = q * (sorted.length - 1);
-  const lo = Math.floor(idx);
-  const hi = Math.ceil(idx);
-  if (lo === hi) return sorted[lo];
-  return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+  const position = q * (sorted.length - 1);
+  const lowerIdx = Math.floor(position);
+  const upperIdx = Math.ceil(position);
+  if (lowerIdx === upperIdx) return sorted[lowerIdx];
+  const gap = sorted[upperIdx] - sorted[lowerIdx];
+  return sorted[lowerIdx] + gap * (position - lowerIdx);
 }
 
+// Slope quartiles over 200 bootstrap refits of the size curve, each
+// refit on a resample drawn with replacement from the live set. The
+// draw order is fixed by the seed, so the quartiles are reproducible.
 export function bootstrapSlope(live: SnapshotProtocol[]): BootstrapSlope {
   if (live.length < 10) {
-    return { p25: -0.4777, p75: -0.4777, n: 0 };
+    const fallback: BootstrapSlope = { p25: -0.4777, p75: -0.4777, n: 0 };
+    return fallback;
   }
-  const rnd = mulberry32(20261121);
-  const slopes: number[] = [];
-  for (let b = 0; b < 200; b++) {
+  const draw = mulberry32(20261121);
+  const fittedSlopes: number[] = [];
+  for (let round = 0; round < 200; round++) {
     const resample: SnapshotProtocol[] = [];
-    for (let i = 0; i < live.length; i++) {
-      resample.push(live[Math.floor(rnd() * live.length)]);
+    for (let k = 0; k < live.length; k++) {
+      resample.push(live[Math.floor(draw() * live.length)]);
     }
-    const curve = fitSizeCurve(resample);
-    slopes.push(curve.slope);
+    const refit = fitSizeCurve(resample);
+    fittedSlopes.push(refit.slope);
   }
-  slopes.sort((a, b) => a - b);
-  return { p25: percentileOf(slopes, 0.25), p75: percentileOf(slopes, 0.75), n: 200 };
+  fittedSlopes.sort((a, b) => a - b);
+  const lower = percentileOf(fittedSlopes, 0.25);
+  const upper = percentileOf(fittedSlopes, 0.75);
+  return { p25: lower, p75: upper, n: 200 };
 }
