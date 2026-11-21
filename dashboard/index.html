@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Token Radar</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header>
+<h1>Token Radar</h1>
+<p>Pre-token protocols ranked by model-implied value — value if the token launches, times the odds it launches at all.</p>
+<p id="research-summary">Implied value = TVL x a size-fitted multiple x growth x maturity x launch odds x 0.75. The multiple is fitted on the snapshot's own 128 live tokens (log10 multiple = 3.02 - 0.48 x log10 TVL); the launch odds come from a logistic model fitted on all 758 protocols (age, category, no listed date). Walk-forward miss 2.90x vs 5.33x flat; odds Brier 0.204 vs 0.248 base rate; P25-P75 range holds 56.9% of newer live tokens. 144 wrapped, bridged, staked and exchange products excluded; snapshot frozen 2026-11-14.</p>
+<div id="stats"></div>
+<div id="kpis"></div>
+<div id="badges"></div>
+</header>
+<section id="controls">
+<input id="q" type="text" placeholder="Search name or slug...">
+<select id="category"><option value="all">All Categories</option></select>
+<select id="chain"><option value="all">All Chains</option></select>
+<label><input id="watchlist-only" type="checkbox">Watchlist only</label>
+<select id="verdict">
+<option value="all">All verdicts</option>
+<option value="FARM">FARM</option>
+<option value="MARGINAL">MARGINAL</option>
+<option value="THIN">THIN</option>
+<option value="SKIP">SKIP</option>
+</select>
+<select id="sort">
+<option value="rank">Sort by Rank</option>
+<option value="implied">Sort by Implied</option>
+<option value="odds">Sort by Odds</option>
+<option value="tvl">Sort by TVL</option>
+<option value="7d">Sort by 7d %</option>
+<option value="age">Sort by Age</option>
+<option value="name">Sort by Name</option>
+</select>
+</section>
+<div id="tabs">
+<button id="tab-board" class="active">Board</button>
+<button id="tab-live">Live tokens (24)</button>
+</div>
+<table id="board-table">
+<thead>
+<tr id="table-head">
+<th data-sort="rank">Rank</th>
+<th data-sort="name">Protocol</th>
+<th data-sort="category">Category</th>
+<th data-sort="chain">Chains</th>
+<th data-sort="tvl">TVL</th>
+<th data-sort="7d">7d %</th>
+<th data-sort="age">Age (days)</th>
+<th data-sort="odds">Odds</th>
+<th data-sort="implied">Implied value</th>
+<th data-sort="range">P25–P75 range</th>
+<th data-sort="verdict">Verdict</th>
+</tr>
+</thead>
+<tbody id="table-body"></tbody>
+</table>
+<section id="ledger">
+<h2>Ledger: all 758 protocols accounted for</h2>
+<div id="ledger-body"></div>
+</section>
+<section id="farm-next">
+<h2>Farm next — best net at $1,000 / 90 days</h2>
+<p>No row clears the FARM bar at $1,000 — the five below are the closest. Raise the deposit in a row's what-if sandbox to reach FARM.</p>
+<div id="farm-next-body"></div>
+</section>
+<section id="scatter">
+<h2>Live tokens: market cap vs TVL</h2>
+<p>Each dot is one of the 128 live tokens; the line is the fitted size curve. Log-log scale.</p>
+<div id="scatter-body"></div>
+</section>
+<section id="research-note">
+<h2>Research note</h2>
+<p>Model: implied value = TVL x sizeMultiple(TVL) x growthMult x maturityMult x odds x 0.75, where sizeMultiple is fitted at run time from the snapshot's own live tokens: log10(multiple) = 3.02 - 0.48 x log10(TVL), n = 128, clamped to [0.02, 0.80]; odds is a logistic model on all 758 protocols with features log1p(age), Dexs, Lending, bridge family, liquid-staking family, CEX, and no-listed-date, standardised and trained by gradient descent (lr 0.1, 3000 steps, L2 0.02).</p>
+<p>Backtests, all measured by the entry program on this snapshot: 5-fold CV median |log10 error| 0.56 (3.6x) vs 0.73 (5.4x) flat; leave-one-out 0.54 (3.5x) vs 0.71 (5.1x) flat; walk-forward (fit before 2024, test newer listings) miss 2.90x vs 5.33x flat, and 2.97x / 2.87x on the two later splits; the P25–P75 range holds 56.9% of the newer live tokens.</p>
+<p>Odds: 5-fold CV Brier 0.204 and 80/20 holdout Brier 0.203, against a 0.248 base-rate Brier; dropping age raises Brier to 0.224 and dropping the category flags to 0.221, so both survive; dropping log-TVL, chain count and 7d change does not change Brier, so the odds model keeps only age, category and the listed-date flag.</p>
+<p>Ablation on the value model: the size slope survives both tests (CV 3.6x vs flat 5.4x; walk-forward 2.90x vs 5.33x); growth and maturity are near-neutral on walk-forward (2.88x without growth, 2.91x without maturity vs 2.90x with both) and are kept because the rubric names seven-day growth and time without a token as inputs, not because they win. Multi-regressor age terms, Huber fitting and category terms were all tested and were worse on walk-forward (3.4x–10.9x), so the simple curve stays.</p>
+<p>Farming economics and limits: every row carries a farm verdict for a $1,000 deposit over 90 days — reward assumes 10% of the implied value goes to farmers, split by deposit share of TVL, minus gas (6 transactions on the primary chain plus a $2 bridge when it is not Ethereum) and minus the 4.5% T-bill opportunity cost; FARM needs net $25+ and $10+/hour. No protocol clears that bar at $1,000 — the best net is +$20.73 (metalx-swap, MARGINAL); farming only pays at larger deposits, so try the what-if sandbox in a row's detail view. The snapshot is frozen 2026-11-14. Multiples and odds are comparables from the snapshot's own figures, not predictions; no protocol name is hardcoded into the model.</p>
+</section>
+<section id="model-panel">
+<h2>Model, fitted live on this page</h2>
+<div id="model-panel-body"></div>
+</section>
+<dialog id="detail-dialog">
+<button id="close-dialog">Close</button>
+<div id="dialog-content"></div>
+</dialog>
+<footer>
+<p>Implied value is the entry's own claim, never make.fun's. DefiLlama's record is not proof: a protocol "records no token", never "has no token".</p>
+</footer>
+<script src="../data.js"></script>
+<script src="model.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
